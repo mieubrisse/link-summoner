@@ -1,3 +1,5 @@
 # Editor/IDE
 .idea/
 .vscode/
+
+build/
