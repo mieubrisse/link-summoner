@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -20,6 +24,8 @@ type LinkInfo struct {
 	StartPos    int
 	EndPos      int
 	Settled     bool
+	Messages    []openai.ChatCompletionMessage
+	RejectedURLs []string
 }
 
 func main() {
@@ -182,13 +188,18 @@ func (lp *LinkProcessor) isURL(s string) bool {
 }
 
 func (lp *LinkProcessor) processLink(link *LinkInfo) error {
-	for !link.Settled {
-		fmt.Printf("\n--- Processing Link ---\n")
-		fmt.Printf("Text: %s\n", link.Text)
-		fmt.Printf("Description: %s\n", link.Description)
-		fmt.Printf("Context: %s\n", link.Sentence)
+	// Print the processing header once per link
+	fmt.Printf("\n\033[1;36m╔══════════════════════════════════════════════════════════════════════════════════════╗\033[0m\n")
+	fmt.Printf("\033[1;36m║                                    \033[37mPROCESSING LINK\033[1;36m                                    ║\033[0m\n")
+	fmt.Printf("\033[1;36m╚══════════════════════════════════════════════════════════════════════════════════════╝\033[0m\n\n")
 
-		url, confidence, reasoning, err := lp.findURL(link.Description, link.Sentence)
+	// Show context with highlighted link
+	contextWithHighlight := lp.highlightLinkInContext(link.Sentence, link.Text, link.Description)
+	fmt.Printf("\033[33mContext:\033[0m %s\n", contextWithHighlight)
+
+	for !link.Settled {
+		fmt.Printf("🤖 Requesting new suggestion from AI...\n")
+		url, confidence, reasoning, err := lp.findURLWithConversation(link)
 		if err != nil {
 			fmt.Printf("API Error: %v\n", err)
 			fmt.Print("Would you like to retry? (y/n): ")
@@ -204,60 +215,172 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 			continue
 		}
 
-		fmt.Printf("\nAI Reasoning: %s\n", reasoning)
-		fmt.Printf("Suggested URL: %s\n", url)
-		fmt.Printf("Confidence: %.1f%%\n", confidence*100)
-
-		if confidence >= 0.8 {
-			fmt.Print("Accept this URL? (y/n/m for more context): ")
-		} else {
-			fmt.Print("Low confidence. Add more context or provide URL? (m/u): ")
+		// Check if this URL was already rejected
+		if lp.isURLRejected(url, link.RejectedURLs) {
+			fmt.Printf("⚠️  AI suggested a previously rejected URL: %s\n", url)
+			fmt.Println("Automatically asking AI for a different link...")
+			
+			// Automatically add feedback to conversation
+			link.Messages = append(link.Messages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleUser,
+				Content: fmt.Sprintf("You already suggested %s and I rejected it. Please provide a different URL.", url),
+			})
+			continue
 		}
 
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
-		response = strings.TrimSpace(strings.ToLower(response))
+		// Verify that the URL is accessible
+		fmt.Printf("🔍 Verifying URL accessibility: %s...", url)
+		isAccessible, statusCode := lp.verifyURL(url)
+		if !isAccessible {
+			fmt.Printf(" ❌ Failed (HTTP %d)\n", statusCode)
+			fmt.Printf("⚠️  The suggested URL is not accessible. Asking AI for a working alternative...\n")
+			
+			// Add this broken URL to rejected list
+			link.RejectedURLs = append(link.RejectedURLs, url)
+			
+			// Update the initial prompt to include this broken URL in the rejected list
+			lp.updateInitialPromptWithRejectedURL(link, url)
+			
+			// Automatically add feedback to conversation
+			link.Messages = append(link.Messages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleUser,
+				Content: fmt.Sprintf("The URL %s is not accessible (HTTP %d). Please provide a working URL that is NOT any of these rejected URLs: %s", url, statusCode, strings.Join(link.RejectedURLs, ", ")),
+			})
+			continue
+		}
+		fmt.Printf(" ✅ Accessible\n")
 
-		switch response {
-		case "y":
-			if confidence >= 0.8 {
-				link.URL = url
-				link.Confidence = confidence
-				link.Settled = true
-				fmt.Printf("✓ Link settled: %s\n", url)
-			} else {
-				fmt.Println("Cannot accept - confidence too low. Please add more context.")
+		// AI Reasoning in dark grey
+		fmt.Printf("\n\033[90m%s\033[0m\n", reasoning)
+		
+		// Suggested URL in yellow with cyan URL
+		fmt.Printf("\033[33mSuggested URL (%.0f%%):\033[0m \033[36m%s\033[0m\n", confidence*100, url)
+
+		// User interaction with this specific URL
+		for {
+			fmt.Print("Accept this URL? (y to accept, v to view in browser, paste a URL to use it, or add context): ")
+
+			reader := bufio.NewReader(os.Stdin)
+			response, _ := reader.ReadString('\n')
+			response = strings.TrimSpace(response)
+
+			switch strings.ToLower(response) {
+			case "y":
+				if confidence >= 0.8 {
+					link.URL = url
+					link.Confidence = confidence
+					link.Settled = true
+					fmt.Printf("✓ Link settled: %s\n", url)
+					return nil
+				} else {
+					fmt.Println("Cannot accept - confidence too low. Please add more context.")
+					// Need to get new AI suggestion - break out of both loops
+					break
+				}
+			case "v":
+				err := lp.openInBrowser(url)
+				if err != nil {
+					fmt.Printf("Error opening browser: %v\n", err)
+				} else {
+					fmt.Printf("Opened %s in browser\n", url)
+				}
+				// Continue in this inner loop - don't change any state
+				continue
+			default:
+				// Check if the user provided a URL directly
+				if lp.isURL(response) {
+					fmt.Printf("Using your provided URL: %s\n", response)
+					link.URL = response
+					link.Confidence = 1.0
+					link.Settled = true
+					fmt.Printf("✓ Link settled with user-provided URL: %s\n", response)
+					return nil
+				}
+				
+				// Add this URL to rejected list since user is providing more context
+				link.RejectedURLs = append(link.RejectedURLs, url)
+				
+				// Update the initial prompt to include this rejected URL
+				lp.updateInitialPromptWithRejectedURL(link, url)
+				
+				// Treat any other input as additional context
+				if response != "" {
+					fmt.Printf("Added context: %s\n", response)
+					// Add user's feedback to the conversation
+					link.Messages = append(link.Messages, openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleUser,
+						Content: fmt.Sprintf("%s (Note: Do NOT suggest any of these rejected URLs: %s)", response, strings.Join(link.RejectedURLs, ", ")),
+					})
+				} else {
+					fmt.Print("Please add more context to the description: ")
+					additionalContext, _ := reader.ReadString('\n')
+					additionalContext = strings.TrimSpace(additionalContext)
+					if additionalContext != "" {
+						fmt.Printf("Added context: %s\n", additionalContext)
+						// Add user's feedback to the conversation
+						link.Messages = append(link.Messages, openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleUser,
+							Content: fmt.Sprintf("%s (Note: Do NOT suggest any of these rejected URLs: %s)", additionalContext, strings.Join(link.RejectedURLs, ", ")),
+						})
+					}
+				}
+				fmt.Println("Refining search with additional context...")
+				// Break out of inner loop to get new AI suggestion
+				break
 			}
-		case "n":
-			if confidence >= 0.8 {
-				fmt.Print("Please add more context to the description: ")
-				additionalContext, _ := reader.ReadString('\n')
-				additionalContext = strings.TrimSpace(additionalContext)
-				link.Description += " " + additionalContext
-			}
-		case "m":
-			fmt.Print("Please add more context to the description: ")
-			additionalContext, _ := reader.ReadString('\n')
-			additionalContext = strings.TrimSpace(additionalContext)
-			link.Description += " " + additionalContext
-		case "u":
-			fmt.Print("Please provide the exact URL: ")
-			userURL, _ := reader.ReadString('\n')
-			userURL = strings.TrimSpace(userURL)
-			if lp.isURL(userURL) {
-				link.URL = userURL
-				link.Confidence = 1.0
-				link.Settled = true
-				fmt.Printf("✓ Link settled with user-provided URL: %s\n", userURL)
-			} else {
-				fmt.Println("Invalid URL format. Please try again.")
-			}
-		default:
-			fmt.Println("Invalid response. Please try again.")
 		}
 	}
 
 	return nil
+}
+
+func (lp *LinkProcessor) findURLWithConversation(link *LinkInfo) (string, float64, string, error) {
+	// Initialize conversation if this is the first request
+	if len(link.Messages) == 0 {
+		rejectedURLsText := ""
+		if len(link.RejectedURLs) > 0 {
+			rejectedURLsText = fmt.Sprintf("\n\nIMPORTANT: Do NOT suggest any of these previously rejected URLs: %s", strings.Join(link.RejectedURLs, ", "))
+		}
+
+		initialPrompt := fmt.Sprintf(`Given this context: "%s"
+
+Find the most appropriate URL for the description: "%s"
+
+Provide your response in exactly this format:
+URL: [the URL you found]
+CONFIDENCE: [a number between 0.0 and 1.0]
+REASONING: [brief explanation of why you chose this URL and how confident you are]
+
+Be conservative with confidence scores. Only use 0.8+ if you're very sure this is the exact resource the user wants.
+
+IMPORTANT: If the user provides feedback about a URL being wrong or broken, you MUST provide a completely different URL. Do not repeat URLs that have been rejected.%s`, link.Sentence, link.Description, rejectedURLsText)
+
+		link.Messages = append(link.Messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: initialPrompt,
+		})
+	}
+
+	resp, err := lp.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:    "gpt-4o-mini",
+			Messages: link.Messages,
+		},
+	)
+
+	if err != nil {
+		return "", 0, "", err
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", 0, "", fmt.Errorf("no response from AI")
+	}
+
+	// Add AI's response to the conversation
+	link.Messages = append(link.Messages, resp.Choices[0].Message)
+
+	return lp.parseAIResponse(resp.Choices[0].Message.Content)
 }
 
 func (lp *LinkProcessor) findURL(description, sentence string) (string, float64, string, error) {
@@ -356,4 +479,90 @@ func (lp *LinkProcessor) applyChanges(text string, links []LinkInfo) string {
 	}
 
 	return result
+}
+
+func (lp *LinkProcessor) highlightLinkInContext(sentence, linkText, description string) string {
+	// Find the markdown link in the sentence
+	linkPattern := fmt.Sprintf(`\[%s\]\(%s\)`, regexp.QuoteMeta(linkText), regexp.QuoteMeta(description))
+	re := regexp.MustCompile(linkPattern)
+	
+	// Replace with highlighted version
+	highlighted := re.ReplaceAllStringFunc(sentence, func(match string) string {
+		// Green for the entire link, bright green for the description
+		return fmt.Sprintf("\033[32m[\033[92m%s\033[32m](\033[92m%s\033[32m)\033[0m", linkText, description)
+	})
+	
+	// Ensure the rest of the text is white
+	return fmt.Sprintf("\033[37m%s\033[0m", highlighted)
+}
+
+func (lp *LinkProcessor) openInBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start"}
+	case "darwin":
+		cmd = "open"
+	default: // "linux", "freebsd", "openbsd", "netbsd"
+		cmd = "xdg-open"
+	}
+	args = append(args, url)
+	return exec.Command(cmd, args...).Start()
+}
+
+func (lp *LinkProcessor) isURLRejected(url string, rejectedURLs []string) bool {
+	for _, rejectedURL := range rejectedURLs {
+		if url == rejectedURL {
+			return true
+		}
+	}
+	return false
+}
+
+func (lp *LinkProcessor) verifyURL(url string) (bool, int) {
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// Make HEAD request to check if URL is accessible
+	resp, err := client.Head(url)
+	if err != nil {
+		// If HEAD fails, try GET request (some servers don't support HEAD)
+		resp, err = client.Get(url)
+		if err != nil {
+			return false, 0
+		}
+	}
+	defer resp.Body.Close()
+
+	// Consider 2xx and 3xx status codes as accessible
+	statusCode := resp.StatusCode
+	isAccessible := statusCode >= 200 && statusCode < 400
+	
+	return isAccessible, statusCode
+}
+
+func (lp *LinkProcessor) updateInitialPromptWithRejectedURL(link *LinkInfo, rejectedURL string) {
+	// Update the first message in the conversation to include the new rejected URL
+	if len(link.Messages) > 0 && link.Messages[0].Role == openai.ChatMessageRoleUser {
+		// Extract the parts of the original prompt
+		originalContent := link.Messages[0].Content
+		
+		// Find where the rejected URLs section starts or where to add it
+		rejectedURLsText := fmt.Sprintf("\n\nIMPORTANT: Do NOT suggest any of these previously rejected URLs: %s", strings.Join(link.RejectedURLs, ", "))
+		
+		// Replace or add the rejected URLs section
+		if strings.Contains(originalContent, "IMPORTANT: Do NOT suggest any of these previously rejected URLs:") {
+			// Replace existing rejected URLs section
+			re := regexp.MustCompile(`\n\nIMPORTANT: Do NOT suggest any of these previously rejected URLs: [^\n]*`)
+			link.Messages[0].Content = re.ReplaceAllString(originalContent, rejectedURLsText)
+		} else {
+			// Add rejected URLs section at the end
+			link.Messages[0].Content = originalContent + rejectedURLsText
+		}
+	}
 }
