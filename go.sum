@@ -1,2 +1,4 @@
 github.com/sashabaranov/go-openai v1.20.4 h1:095xQ/fAtRa0+Rj21sezVJABgKfGPNbyx/sAN/hJUmg=
 github.com/sashabaranov/go-openai v1.20.4/go.mod h1:lj5b/K+zjTSFxVLijLSTDZuP7adOgerWeFyZLUhAKRg=
+github.com/serpapi/serpapi-golang v0.0.0-20250619150544-f1bfb86616c7 h1:twJZRDLLvLkOlVffLIoethFGUES1uMTliVPPNs4x5Dk=
+github.com/serpapi/serpapi-golang v0.0.0-20250619150544-f1bfb86616c7/go.mod h1:xVL4PnCuCPwkXhVVQysVrX3hEv7nWnIbfnDj2B+hsPw=

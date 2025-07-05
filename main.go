@@ -13,19 +13,28 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	serpapi "github.com/serpapi/serpapi-golang"
 )
 
+type SearchResult struct {
+	Title   string
+	URL     string
+	Snippet string
+}
+
 type LinkInfo struct {
-	Text        string
-	Description string
-	URL         string
-	Confidence  float64
-	Sentence    string
-	StartPos    int
-	EndPos      int
-	Settled     bool
-	Messages    []openai.ChatCompletionMessage
-	RejectedURLs []string
+	Text          string
+	Description   string
+	URL           string
+	Confidence    float64
+	Sentence      string
+	StartPos      int
+	EndPos        int
+	Settled       bool
+	Messages      []openai.ChatCompletionMessage
+	RejectedURLs  []string
+	SearchQuery   string
+	SearchResults []SearchResult
 }
 
 func main() {
@@ -54,14 +63,25 @@ func main() {
 		outputFile = os.Args[2]
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
+	openaiApiKey := os.Getenv("OPENAI_API_KEY")
+	if openaiApiKey == "" {
 		fmt.Fprintf(os.Stderr, "Error: OPENAI_API_KEY environment variable not set\n")
 		os.Exit(1)
 	}
 
+	serpapiApiKey := os.Getenv("SERPAPI_API_KEY")
+	if serpapiApiKey == "" {
+		fmt.Fprintf(os.Stderr, "Error: SERPAPI_API_KEY environment variable not set\n")
+		os.Exit(1)
+	}
+
+	serpapiSetting := serpapi.NewSerpApiClientSetting(serpapiApiKey)
+	serpapiSetting.Engine = "google"
+	serpapiClient := serpapi.NewClient(serpapiSetting)
+
 	processor := &LinkProcessor{
-		client: openai.NewClient(apiKey),
+		openaiClient:  openai.NewClient(openaiApiKey),
+		serpapiClient: serpapiClient,
 	}
 
 	err := processor.ProcessFile(inputFile, outputFile, inPlace)
@@ -72,7 +92,8 @@ func main() {
 }
 
 type LinkProcessor struct {
-	client *openai.Client
+	openaiClient  *openai.Client
+	serpapiClient serpapi.SerpApiClient
 }
 
 func (lp *LinkProcessor) ProcessFile(inputFile, outputFile string, inPlace bool) error {
@@ -147,7 +168,7 @@ func (lp *LinkProcessor) extractLinks(text string) []LinkInfo {
 		if len(match) >= 3 {
 			// Find the sentence containing this link
 			sentence := lp.extractSentence(text, indices[i][0])
-			
+
 			links = append(links, LinkInfo{
 				Text:        match[1],
 				Description: match[2],
@@ -203,11 +224,11 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 		if err != nil {
 			fmt.Printf("API Error: %v\n", err)
 			fmt.Print("Would you like to retry? (y/n): ")
-			
+
 			reader := bufio.NewReader(os.Stdin)
 			response, _ := reader.ReadString('\n')
 			response = strings.TrimSpace(response)
-			
+
 			if strings.ToLower(response) != "y" {
 				fmt.Printf("Skipping this link.\n")
 				return nil
@@ -219,7 +240,7 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 		if lp.isURLRejected(url, link.RejectedURLs) {
 			fmt.Printf("⚠️  AI suggested a previously rejected URL: %s\n", url)
 			fmt.Println("Automatically asking AI for a different link...")
-			
+
 			// Automatically add feedback to conversation
 			link.Messages = append(link.Messages, openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
@@ -234,13 +255,13 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 		if !isAccessible {
 			fmt.Printf(" ❌ Failed (HTTP %d)\n", statusCode)
 			fmt.Printf("⚠️  The suggested URL is not accessible. Asking AI for a working alternative...\n")
-			
+
 			// Add this broken URL to rejected list
 			link.RejectedURLs = append(link.RejectedURLs, url)
-			
+
 			// Update the initial prompt to include this broken URL in the rejected list
 			lp.updateInitialPromptWithRejectedURL(link, url)
-			
+
 			// Automatically add feedback to conversation
 			link.Messages = append(link.Messages, openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
@@ -252,7 +273,7 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 
 		// AI Reasoning in dark grey
 		fmt.Printf("\n\033[90m%s\033[0m\n", reasoning)
-		
+
 		// Suggested URL in yellow with cyan URL
 		fmt.Printf("\033[33mSuggested URL (%.0f%%):\033[0m \033[36m%s\033[0m\n", confidence*100, url)
 
@@ -296,13 +317,13 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 					fmt.Printf("✓ Link settled with user-provided URL: %s\n", response)
 					return nil
 				}
-				
+
 				// Add this URL to rejected list since user is providing more context
 				link.RejectedURLs = append(link.RejectedURLs, url)
-				
+
 				// Update the initial prompt to include this rejected URL
 				lp.updateInitialPromptWithRejectedURL(link, url)
-				
+
 				// Treat any other input as additional context
 				if response != "" {
 					fmt.Printf("Added context: %s\n", response)
@@ -361,7 +382,7 @@ IMPORTANT: If the user provides feedback about a URL being wrong or broken, you 
 		})
 	}
 
-	resp, err := lp.client.CreateChatCompletion(
+	resp, err := lp.openaiClient.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
 			Model:    "gpt-4o-mini",
@@ -395,7 +416,7 @@ REASONING: [brief explanation of why you chose this URL and how confident you ar
 
 Be conservative with confidence scores. Only use 0.8+ if you're very sure this is the exact resource the user wants.`, sentence, description)
 
-	resp, err := lp.client.CreateChatCompletion(
+	resp, err := lp.openaiClient.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
 			Model: "gpt-4o-mini",
@@ -461,12 +482,12 @@ func (lp *LinkProcessor) applyChanges(text string, links []LinkInfo) string {
 		if link.Settled && link.URL != "" {
 			oldLink := fmt.Sprintf("[%s](%s)", link.Text, link.Description)
 			newLink := fmt.Sprintf("[%s](%s)", link.Text, link.URL)
-			
+
 			// Replace only the specific instance at the known position
 			before := result[:link.StartPos]
 			after := result[link.EndPos:]
 			result = before + newLink + after
-			
+
 			// Update positions for remaining links
 			sizeDiff := len(newLink) - len(oldLink)
 			for i := range sortedLinks {
@@ -485,13 +506,13 @@ func (lp *LinkProcessor) highlightLinkInContext(sentence, linkText, description 
 	// Find the markdown link in the sentence
 	linkPattern := fmt.Sprintf(`\[%s\]\(%s\)`, regexp.QuoteMeta(linkText), regexp.QuoteMeta(description))
 	re := regexp.MustCompile(linkPattern)
-	
+
 	// Replace with highlighted version
 	highlighted := re.ReplaceAllStringFunc(sentence, func(match string) string {
 		// Green for the entire link, bright green for the description
 		return fmt.Sprintf("\033[32m[\033[92m%s\033[32m](\033[92m%s\033[32m)\033[0m", linkText, description)
 	})
-	
+
 	// Ensure the rest of the text is white
 	return fmt.Sprintf("\033[37m%s\033[0m", highlighted)
 }
@@ -542,7 +563,7 @@ func (lp *LinkProcessor) verifyURL(url string) (bool, int) {
 	// Consider 2xx and 3xx status codes as accessible
 	statusCode := resp.StatusCode
 	isAccessible := statusCode >= 200 && statusCode < 400
-	
+
 	return isAccessible, statusCode
 }
 
@@ -551,10 +572,10 @@ func (lp *LinkProcessor) updateInitialPromptWithRejectedURL(link *LinkInfo, reje
 	if len(link.Messages) > 0 && link.Messages[0].Role == openai.ChatMessageRoleUser {
 		// Extract the parts of the original prompt
 		originalContent := link.Messages[0].Content
-		
+
 		// Find where the rejected URLs section starts or where to add it
 		rejectedURLsText := fmt.Sprintf("\n\nIMPORTANT: Do NOT suggest any of these previously rejected URLs: %s", strings.Join(link.RejectedURLs, ", "))
-		
+
 		// Replace or add the rejected URLs section
 		if strings.Contains(originalContent, "IMPORTANT: Do NOT suggest any of these previously rejected URLs:") {
 			// Replace existing rejected URLs section
