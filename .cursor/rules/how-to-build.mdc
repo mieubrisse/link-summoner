@@ -1,0 +1,12 @@
+---
+description: Tells Cursor how to build this project
+globs:
+alwaysApply: false
+---
+
+When building this project, you should use the following in the root of the repo:
+```
+bash build.sh
+```
+
+Do not use regular `go build`.
