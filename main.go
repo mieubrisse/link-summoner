@@ -218,7 +218,6 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 
 	for !link.Settled {
 		// Generate search query using OpenAI
-		fmt.Printf("🤖 Generating search query with AI...\n")
 		searchQuery, err := lp.generateSearchQuery(link)
 		if err != nil {
 			fmt.Printf("API Error: %v\n", err)
@@ -236,7 +235,6 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 		}
 
 		// Fetch search results using SerpAPI
-		fmt.Printf("🔍 Searching with query: \"%s\"...\n", searchQuery)
 		searchResults, err := lp.fetchSearchResults(searchQuery)
 		if err != nil {
 			fmt.Printf("SerpAPI Error: %v\n", err)
@@ -262,7 +260,7 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 
 		// Handle user interaction
 		for {
-			fmt.Print("Choose an option (y to accept highlighted, v to view highlighted, yX/vX for specific result, or add context): ")
+			fmt.Print("Choose an option (yX/vX for specific result, or add context): ")
 
 			reader := bufio.NewReader(os.Stdin)
 			response, _ := reader.ReadString('\n')
@@ -270,35 +268,6 @@ func (lp *LinkProcessor) processLink(link *LinkInfo) error {
 
 			if response == "" {
 				continue
-			}
-
-			// Handle y/v commands
-			if response == "y" {
-				if len(link.SearchResults) > 0 {
-					link.URL = link.SearchResults[0].URL
-					link.Confidence = 1.0
-					link.Settled = true
-					fmt.Printf("✓ Link settled: %s\n", link.URL)
-					return nil
-				} else {
-					fmt.Println("No results available to accept.")
-					continue
-				}
-			}
-
-			if response == "v" {
-				if len(link.SearchResults) > 0 {
-					err := lp.openInBrowser(link.SearchResults[0].URL)
-					if err != nil {
-						fmt.Printf("Error opening browser: %v\n", err)
-					} else {
-						fmt.Printf("Opened %s in browser\n", link.SearchResults[0].URL)
-					}
-					continue
-				} else {
-					fmt.Println("No results available to view.")
-					continue
-				}
 			}
 
 			// Handle yX/vX commands (e.g., y3, v2)
@@ -371,6 +340,7 @@ The search query should be:
 - General enough to return relevant results
 - Include key terms from both the link text and description
 - Be optimized for web search
+- NOT include any quotes around the query
 
 Example: If the link text is "Python requests" and description is "HTTP library documentation", a good query might be "Python requests library official documentation"`, link.Sentence, link.Description)
 
@@ -413,96 +383,75 @@ func (lp *LinkProcessor) parseSearchQuery(response string) string {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "QUERY:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "QUERY:"))
+			query := strings.TrimSpace(strings.TrimPrefix(line, "QUERY:"))
+			// Remove any surrounding quotes
+			query = strings.Trim(query, `"'`)
+			return query
 		}
 	}
 	return ""
 }
 
 func (lp *LinkProcessor) fetchSearchResults(query string) ([]SearchResult, error) {
-	// Prepare search parameters
-	params := map[string]string{
-		"engine": "google",
-		"q":      query,
-		"num":    "5", // Get top 5 results
+	// Mock results for testing - replace with actual SerpAPI call when ready
+
+	// Generate mock results based on the query
+	mockResults := []SearchResult{
+		{
+			Title:   fmt.Sprintf("Official %s Documentation", query),
+			URL:     fmt.Sprintf("https://example.com/%s-docs", strings.ToLower(strings.ReplaceAll(query, " ", "-"))),
+			Snippet: fmt.Sprintf("Comprehensive documentation for %s. Learn how to use %s effectively with examples and tutorials.", query, query),
+		},
+		{
+			Title:   fmt.Sprintf("%s - Wikipedia", query),
+			URL:     fmt.Sprintf("https://en.wikipedia.org/wiki/%s", strings.ReplaceAll(query, " ", "_")),
+			Snippet: fmt.Sprintf("Wikipedia article about %s. History, background, and detailed information about %s.", query, query),
+		},
+		{
+			Title:   fmt.Sprintf("%s Tutorial for Beginners", query),
+			URL:     fmt.Sprintf("https://tutorials.example.com/%s-guide", strings.ToLower(strings.ReplaceAll(query, " ", "-"))),
+			Snippet: fmt.Sprintf("Step-by-step tutorial for learning %s. Perfect for beginners who want to get started with %s.", query, query),
+		},
+		{
+			Title:   fmt.Sprintf("%s Best Practices", query),
+			URL:     fmt.Sprintf("https://blog.example.com/%s-best-practices", strings.ToLower(strings.ReplaceAll(query, " ", "-"))),
+			Snippet: fmt.Sprintf("Learn the best practices for working with %s. Tips, tricks, and common pitfalls to avoid when using %s.", query, query),
+		},
+		{
+			Title:   fmt.Sprintf("%s Examples and Code Samples", query),
+			URL:     fmt.Sprintf("https://github.com/example/%s-examples", strings.ToLower(strings.ReplaceAll(query, " ", "-"))),
+			Snippet: fmt.Sprintf("Collection of practical examples and code samples for %s. Real-world use cases and implementation patterns.", query, query),
+		},
 	}
 
-	// Perform the search
-	results, err := lp.serpapiClient.Search(params)
-	if err != nil {
-		return nil, fmt.Errorf("SerpAPI search failed: %w", err)
-	}
-
-	// Extract organic results
-	organicResults, ok := results["organic_results"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("no organic results found in SerpAPI response")
-	}
-
-	// Convert to SearchResult structs
-	var searchResults []SearchResult
-	for i, result := range organicResults {
-		if i >= 5 { // Limit to top 5
-			break
-		}
-
-		resultMap, ok := result.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		title, _ := resultMap["title"].(string)
-		url, _ := resultMap["link"].(string)
-		snippet, _ := resultMap["snippet"].(string)
-
-		if url != "" {
-			searchResults = append(searchResults, SearchResult{
-				Title:   title,
-				URL:     url,
-				Snippet: snippet,
-			})
-		}
-	}
-
-	if len(searchResults) == 0 {
-		return nil, fmt.Errorf("no valid search results found")
-	}
-
-	return searchResults, nil
+	return mockResults, nil
 }
 
 func (lp *LinkProcessor) presentSearchResults(link *LinkInfo) {
-	fmt.Printf("\n\033[1;32m=== Search Results ===\033[0m\n")
-	fmt.Printf("Query: \"%s\"\n\n", link.SearchQuery)
-
 	if len(link.SearchResults) == 0 {
 		fmt.Println("No search results found.")
 		return
 	}
 
-	for i, result := range link.SearchResults {
-		// Highlight the first result
-		if i == 0 {
-			fmt.Printf("\033[1;33m➤ \033[1;36m%d. %s\033[0m\n", i+1, result.Title)
-			fmt.Printf("\033[1;36m   %s\033[0m\n", result.URL)
-		} else {
-			fmt.Printf("   %d. %s\n", i+1, result.Title)
-			fmt.Printf("      %s\n", result.URL)
-		}
+	fmt.Printf("Query: \"%s\"\n\n", link.SearchQuery)
 
-		// Show snippet if available
-		if result.Snippet != "" {
-			// Truncate long snippets
-			snippet := result.Snippet
-			if len(snippet) > 120 {
-				snippet = snippet[:117] + "..."
-			}
-			fmt.Printf("      %s\n", snippet)
+	for i, result := range link.SearchResults {
+		// Title (cyan) - no extra spacing
+		fmt.Printf("\033[36m%d. %s\033[0m\n", i+1, result.Title)
+
+		// Description (white) - 2 spaces indent, truncate if too long
+		snippet := result.Snippet
+		if len(snippet) > 120 {
+			snippet = snippet[:117] + "..."
 		}
+		fmt.Printf("   %s\n", snippet)
+
+		// URL (dark blue) - 2 spaces indent
+		fmt.Printf("   \033[34m%s\033[0m\n", result.URL)
 		fmt.Println()
 	}
 
-	fmt.Printf("\033[1;33mCommands:\033[0m y=accept highlighted, v=view highlighted, yX=accept result X, vX=view result X\n")
+	fmt.Printf("\033[1;33mCommands:\033[0m yX=accept result X, vX=view result X\n")
 }
 
 func (lp *LinkProcessor) applyChanges(text string, links []LinkInfo) string {

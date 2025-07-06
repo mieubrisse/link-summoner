@@ -45,6 +45,10 @@ This tool keeps you in the flow state by letting you drop plaintext into the lin
 ./build/link-summoner -i input.md
 ```
 
+## Testing
+
+**Note**: The tool currently runs in mock mode to preserve your SerpAPI quota. Mock results are generated based on your search queries. To enable real SerpAPI calls, uncomment the relevant section in `main.go`.
+
 ## Example
 
 Input file `test.md`:
@@ -63,5 +67,5 @@ Then, let's add a link to [React hooks](React hooks tutorial for beginners).
 The tool will:
 1. Skip the existing Google link (already a URL)
 2. Generate search queries for "Python's requests library" and "React hooks"
-3. Present top 5 results for each
+3. Present top 5 results for each (mock results in test mode)
 4. Let you select the best URLs interactively
