@@ -3,6 +3,8 @@ When writing in Markdown, stopping to fill in link URLs can distract you into yo
 
 > ❗ THIS TOOL ISN'T READY YET
 
+TODO add ability to fill in missing reference links too
+
 To keep you in the flow state, you can drop plaintext into the link URL (between parentheses) and then clean them up later with this tool.
 
 For example, you might write:
